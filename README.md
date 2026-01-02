@@ -2,6 +2,12 @@
 
 A beautiful terminal UI (TUI) weather station monitor for WeatherFlow Tempest data, built with the Charm suite of libraries (Bubble Tea, Lipgloss).
 
+Supports two data sources:
+- **📡 UDP Mode** - Listens directly to UDP broadcasts from your Tempest station (port 50222)
+- **🗄️ InfluxDB Mode** - Queries weather data from an InfluxDB instance
+
+The app automatically detects which mode to use based on environment variables.
+
 ## Features
 
 - **Real-time weather data display:**
@@ -19,13 +25,18 @@ A beautiful terminal UI (TUI) weather station monitor for WeatherFlow Tempest da
 
 - **Visual compass:** Shows current wind direction with highlighted cardinal directions and arrow indicator
 
-- **Auto-refreshes:** Updates every 2 seconds
+- **Data source indicator:** Shows 📡 for UDP mode or 🗄️ for InfluxDB mode in the title
+
+- **Auto-refreshes:**
+  - UDP mode: Updates in real-time as broadcasts are received
+  - InfluxDB mode: Polls every 2 seconds
 
 ## Requirements
 
 - **Go 1.23+** for building
-- **InfluxDB 2.x** with WeatherFlow Tempest data
-- **WeatherFlow Tempest weather station** data being ingested into InfluxDB
+- **WeatherFlow Tempest weather station**
+- For UDP mode: Station on the same local network
+- For InfluxDB mode: InfluxDB 2.x instance with Tempest data
 
 ## Setup
 
@@ -36,151 +47,121 @@ git clone <repo-url>
 cd glanceswx
 ```
 
-### 2. Configure environment variables
-
-Copy the example environment file:
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` with your configuration:
-
-```bash
-# InfluxDB Configuration
-INFLUX_HOST=https://your-influx-host.com
-INFLUX_PORT=443
-INFLUX_ORG=your-org-id
-INFLUX_BUCKET=your-bucket-name
-INFLUX_TOKEN=your-influx-token
-
-# WeatherFlow Tempest Station IDs
-WEATHER_MEASUREMENT=ST-00000000_observation
-STATUS_MEASUREMENT=ST-00000000_status
-```
-
-#### Finding your station IDs:
-
-Your WeatherFlow Tempest creates measurements in InfluxDB with names like:
-- `ST-XXXXXXXX_observation` - weather observations
-- `ST-XXXXXXXX_status` - station status (battery, uptime)
-
-Replace `ST-XXXXXXXX` with your actual station ID. You can find this by:
-1. Querying your InfluxDB bucket for measurements
-2. Looking at the WeatherFlow app or dashboard
-3. Checking your Home Assistant entity IDs if using that integration
-
-### 3. Build the application
+### 2. Build the application
 
 ```bash
 go mod download
 go build -o glanceswx
 ```
 
-### 4. Run
+### 3. Choose your data source
+
+#### Option A: UDP Mode (Default, No Configuration Needed)
+
+Simply run without any environment variables:
 
 ```bash
 ./glanceswx
 ```
 
+The app will listen on UDP port 50222 for broadcasts from your Tempest station. Data appears as soon as the station sends its next update (typically every minute).
+
+#### Option B: InfluxDB Mode
+
+Copy the example environment file and configure:
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` with your InfluxDB configuration:
+
+```bash
+INFLUX_HOST=https://your-influx-host.com
+INFLUX_PORT=443
+INFLUX_ORG=your-org-id
+INFLUX_BUCKET=your-bucket-name
+INFLUX_TOKEN=your-influx-token
+WEATHER_MEASUREMENT=ST-00000000_observation
+STATUS_MEASUREMENT=ST-00000000_status
+```
+
+Then run:
+
+```bash
+./glanceswx
+```
+
+The app will automatically use InfluxDB mode when all required environment variables are set.
+
 Press `q` or `Ctrl+C` to quit.
 
-## InfluxDB Queries
+## How It Works
 
-The application queries your InfluxDB instance with the following Flux queries:
+### UDP Mode (📡)
 
-### Current Weather Data
-```flux
-from(bucket: "your-bucket")
-  |> range(start: -5m)
-  |> filter(fn: (r) => r._measurement == "ST-XXXXXXXX_observation")
-  |> last()
-```
+The app listens for UDP broadcasts on port 50222, which the Tempest weather station sends to your local network. It parses two types of messages:
 
-**Fields used:**
-- `temperature_air` - Converted from Celsius to Fahrenheit
-- `r-humidity` - Relative humidity percentage
-- `pressure_station` - Converted from Pascals to millibars
-- `wind_speed` - Converted from m/s to mph
-- `wind_direction` - Degrees (0-360)
-- `uv` - UV index
-- `irradiance_sun` - Solar radiation in W/m²
-- `rain_accumulation` - Converted from mm to inches
+**Observation Messages (`obs_st`)**
+- Temperature (converted from Celsius to Fahrenheit)
+- Humidity
+- Barometric pressure
+- Wind speed and direction (converted from m/s to mph)
+- Wind gust (tracked in-memory for 24h max and all-time max)
+- UV index
+- Solar radiation
+- Precipitation accumulation (converted from mm to inches)
+- Battery voltage
 
-### Wind Gust (24h Max)
-```flux
-from(bucket: "your-bucket")
-  |> range(start: -24h)
-  |> filter(fn: (r) => r._measurement == "ST-XXXXXXXX_observation")
-  |> filter(fn: (r) => r._field == "wind_gust")
-  |> max()
-```
+**Status Messages (`device_status`)**
+- Battery voltage
+- Station uptime
 
-### Wind Gust (All-Time Max)
-```flux
-from(bucket: "your-bucket")
-  |> range(start: -365d)
-  |> filter(fn: (r) => r._measurement == "ST-XXXXXXXX_observation")
-  |> filter(fn: (r) => r._field == "wind_gust")
-  |> max()
-```
+### InfluxDB Mode (🗄️)
 
-### Station Status
-```flux
-from(bucket: "your-bucket")
-  |> range(start: -5m)
-  |> filter(fn: (r) => r._measurement == "ST-XXXXXXXX_status")
-  |> last()
-```
-
-**Fields used:**
-- `voltage` - Battery voltage
-- `uptime` - Station uptime in seconds
+The app queries your InfluxDB instance every 2 seconds using Flux queries to retrieve:
+- Current weather observations from your specified measurement
+- 24-hour and all-time wind gust maximums
+- Station status (battery, uptime)
 
 ## Running from Anywhere
 
 If you want to run the binary from anywhere on your system:
 
-### Option 1: Add to PATH
 ```bash
 sudo cp glanceswx /usr/local/bin/
 ```
 
-Then export environment variables in your shell config (`~/.bashrc`, `~/.zshrc`, etc.):
+Then you can run it from any directory:
 ```bash
-export INFLUX_HOST=https://your-influx-host.com
-export INFLUX_PORT=443
-export INFLUX_ORG=your-org-id
-export INFLUX_BUCKET=your-bucket-name
-export INFLUX_TOKEN=your-influx-token
-export WEATHER_MEASUREMENT=ST-00000000_observation
-export STATUS_MEASUREMENT=ST-00000000_status
-```
-
-### Option 2: Wrapper Script
-Create a script (e.g., `~/bin/wx`):
-```bash
-#!/bin/bash
-cd /home/dx/code/glanceswx && ./glanceswx
-```
-
-Make it executable:
-```bash
-chmod +x ~/bin/wx
+glanceswx
 ```
 
 ## Troubleshooting
 
-### "Missing required environment variables"
-- Ensure all environment variables in `.env` are set
-- If running from another directory, make sure the `.env` file is being loaded or export the variables
+### UDP Mode Issues
 
-### "No data showing"
+**"No data showing" or "Waiting for weather data"**
+- Verify your Tempest station is on the same network
+- Check that UDP broadcasts are not blocked by a firewall
+- Tempest stations broadcast observations every minute - wait at least 60 seconds
+- Ensure the station is powered on and online
+- Look for the 📡 indicator in the title to confirm UDP mode is active
+
+**"failed to listen on UDP port 50222"**
+- Port 50222 may already be in use by another application
+- Try stopping other weather monitoring applications
+- On Linux/Mac, you may need elevated permissions: `sudo ./glanceswx`
+
+### InfluxDB Mode Issues
+
+**"No data showing"**
 - Verify your InfluxDB connection with a test query
 - Check that your bucket name and measurement names are correct
-- Ensure data is actively being written to InfluxDB from your WeatherFlow station
+- Ensure data is actively being written to InfluxDB from your Tempest station
+- Look for the 🗄️ indicator in the title to confirm InfluxDB mode is active
 
-### "Cannot connect to InfluxDB"
+**"Cannot connect to InfluxDB"**
 - Verify `INFLUX_HOST` includes the protocol (`https://` or `http://`)
 - Check that your InfluxDB token has read permissions for the bucket
 - Ensure network connectivity to your InfluxDB instance

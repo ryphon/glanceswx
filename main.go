@@ -2,10 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"math"
+	"net"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -34,6 +38,12 @@ var (
 			Padding(1, 2)
 )
 
+type DataSource int
+
+const (
+	SourceUDP DataSource = iota
+	SourceInfluxDB
+)
 
 type WeatherData struct {
 	Temperature    float64
@@ -51,74 +61,225 @@ type WeatherData struct {
 	UpdatedAt      time.Time
 }
 
+// TempestObservation represents the UDP broadcast message from Tempest
+type TempestObservation struct {
+	SerialNumber string      `json:"serial_number"`
+	Type         string      `json:"type"`
+	HubSN        string      `json:"hub_sn"`
+	Obs          [][]float64 `json:"obs"`
+}
+
+// TempestStatus represents device status messages
+type TempestStatus struct {
+	SerialNumber string  `json:"serial_number"`
+	Type         string  `json:"type"`
+	HubSN        string  `json:"hub_sn"`
+	Timestamp    int64   `json:"timestamp"`
+	Uptime       int64   `json:"uptime"`
+	Voltage      float64 `json:"voltage"`
+}
+
 type model struct {
 	weather            WeatherData
 	spinner            spinner.Model
 	loading            bool
 	err                error
+	width              int
+	height             int
+	dataSource         DataSource
+	udpListener        *UDPListener
 	client             influxdb2.Client
 	bucket             string
 	org                string
 	weatherMeasurement string
 	statusMeasurement  string
-	width              int
-	height             int
 }
 
 type tickMsg time.Time
 type weatherMsg WeatherData
 type errMsg error
 
-func initialModel() model {
-	_ = godotenv.Load()
+// UDPListener handles receiving Tempest weather data
+type UDPListener struct {
+	conn        *net.UDPConn
+	weatherData WeatherData
+	mu          sync.RWMutex
+	windGusts   []windGustRecord
+	program     *tea.Program
+}
 
-	host := os.Getenv("INFLUX_HOST")
-	token := os.Getenv("INFLUX_TOKEN")
-	org := os.Getenv("INFLUX_ORG")
-	bucket := os.Getenv("INFLUX_BUCKET")
-	weatherMeasurement := os.Getenv("WEATHER_MEASUREMENT")
-	statusMeasurement := os.Getenv("STATUS_MEASUREMENT")
+type windGustRecord struct {
+	gust      float64
+	timestamp time.Time
+}
 
-	if host == "" || token == "" || org == "" || bucket == "" {
-		panic("Missing required InfluxDB environment variables")
+func NewUDPListener() (*UDPListener, error) {
+	addr := net.UDPAddr{
+		Port: 50222,
+		IP:   net.IPv4zero,
 	}
 
-	if weatherMeasurement == "" || statusMeasurement == "" {
-		panic("Missing required measurement environment variables (WEATHER_MEASUREMENT, STATUS_MEASUREMENT)")
+	conn, err := net.ListenUDP("udp", &addr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to listen on UDP port 50222: %w", err)
 	}
 
-	client := influxdb2.NewClient(host, token)
+	return &UDPListener{
+		conn:        conn,
+		weatherData: WeatherData{UpdatedAt: time.Now()},
+		windGusts:   make([]windGustRecord, 0),
+	}, nil
+}
 
-	s := spinner.New()
-	s.Spinner = spinner.Dot
-	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF6B6B"))
+func (u *UDPListener) Start(p *tea.Program) {
+	u.program = p
+	go u.listen()
+	go u.cleanupOldGusts()
+}
 
-	return model{
-		spinner:            s,
-		loading:            true,
-		client:             client,
-		bucket:             bucket,
-		org:                org,
-		weatherMeasurement: weatherMeasurement,
-		statusMeasurement:  statusMeasurement,
+func (u *UDPListener) listen() {
+	buffer := make([]byte, 4096)
+
+	for {
+		n, _, err := u.conn.ReadFromUDP(buffer)
+		if err != nil {
+			continue
+		}
+
+		u.handleMessage(buffer[:n])
 	}
 }
 
-func (m model) Init() tea.Cmd {
-	return tea.Batch(
-		m.spinner.Tick,
-		fetchWeather(m.client, m.bucket, m.org, m.weatherMeasurement, m.statusMeasurement),
-		tickCmd(),
-	)
+func (u *UDPListener) handleMessage(data []byte) {
+	// Try to parse as observation
+	var obs TempestObservation
+	if err := json.Unmarshal(data, &obs); err == nil && obs.Type == "obs_st" {
+		u.processObservation(obs)
+		return
+	}
+
+	// Try to parse as status
+	var status TempestStatus
+	if err := json.Unmarshal(data, &status); err == nil && status.Type == "device_status" {
+		u.processStatus(status)
+		return
+	}
 }
 
-func tickCmd() tea.Cmd {
-	return tea.Tick(time.Second*2, func(t time.Time) tea.Msg {
-		return tickMsg(t)
+func (u *UDPListener) processObservation(obs TempestObservation) {
+	if len(obs.Obs) == 0 || len(obs.Obs[0]) < 18 {
+		return
+	}
+
+	// obs_st format:
+	// [0] Time Epoch
+	// [1] Wind Lull (m/s)
+	// [2] Wind Avg (m/s)
+	// [3] Wind Gust (m/s)
+	// [4] Wind Direction (degrees)
+	// [5] Wind Sample Interval (seconds)
+	// [6] Station Pressure (MB)
+	// [7] Air Temperature (C)
+	// [8] Relative Humidity (%)
+	// [9] Illuminance (lux)
+	// [10] UV Index
+	// [11] Solar Radiation (W/m^2)
+	// [12] Rain Accumulated (mm)
+	// [13] Precipitation Type
+	// [14] Lightning Strike Avg Distance (km)
+	// [15] Lightning Strike Count
+	// [16] Battery (volts)
+	// [17] Report Interval (minutes)
+
+	data := obs.Obs[0]
+
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	u.weatherData.WindSpeed = data[2] * 2.237          // m/s to mph
+	u.weatherData.WindDirection = data[4]              // degrees
+	u.weatherData.Pressure = data[6]                   // already in mb
+	u.weatherData.Temperature = data[7]*9.0/5.0 + 32.0 // C to F
+	u.weatherData.Humidity = data[8]                   // %
+	u.weatherData.UV = data[10]                        // UV index
+	u.weatherData.SolarRadiation = data[11]            // W/m^2
+	u.weatherData.Precipitation = data[12] / 25.4      // mm to inches
+	u.weatherData.BatteryVoltage = data[16]            // volts
+	u.weatherData.UpdatedAt = time.Now()
+
+	// Track wind gust
+	gust := data[3] * 2.237 // m/s to mph
+	u.windGusts = append(u.windGusts, windGustRecord{
+		gust:      gust,
+		timestamp: time.Now(),
 	})
+
+	// Calculate max gusts
+	u.calculateWindGusts()
+
+	// Send update to program
+	if u.program != nil {
+		u.program.Send(weatherMsg(u.weatherData))
+	}
 }
 
-func fetchWeather(client influxdb2.Client, bucket, org, weatherMeasurement, statusMeasurement string) tea.Cmd {
+func (u *UDPListener) processStatus(status TempestStatus) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	u.weatherData.StationUptime = status.Uptime
+	u.weatherData.BatteryVoltage = status.Voltage
+
+	// Send update to program
+	if u.program != nil {
+		u.program.Send(weatherMsg(u.weatherData))
+	}
+}
+
+func (u *UDPListener) calculateWindGusts() {
+	now := time.Now()
+	max24h := 0.0
+	maxAllTime := 0.0
+
+	for _, record := range u.windGusts {
+		if record.gust > maxAllTime {
+			maxAllTime = record.gust
+		}
+		if now.Sub(record.timestamp) <= 24*time.Hour && record.gust > max24h {
+			max24h = record.gust
+		}
+	}
+
+	u.weatherData.WindGust24h = max24h
+	u.weatherData.WindGustMax = maxAllTime
+}
+
+func (u *UDPListener) cleanupOldGusts() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		u.mu.Lock()
+		now := time.Now()
+		filtered := make([]windGustRecord, 0)
+		for _, record := range u.windGusts {
+			// Keep records from last 365 days
+			if now.Sub(record.timestamp) <= 365*24*time.Hour {
+				filtered = append(filtered, record)
+			}
+		}
+		u.windGusts = filtered
+		u.mu.Unlock()
+	}
+}
+
+func (u *UDPListener) Close() {
+	if u.conn != nil {
+		u.conn.Close()
+	}
+}
+
+func fetchWeatherInfluxDB(client influxdb2.Client, bucket, org, weatherMeasurement, statusMeasurement string) tea.Cmd {
 	return func() tea.Msg {
 		ctx := context.Background()
 		queryAPI := client.QueryAPI(org)
@@ -253,13 +414,130 @@ from(bucket: "%s")
 	}
 }
 
+func getConfig(mode, host, token, org, bucket, weatherMeasurement, statusMeasurement *string) (string, string, string, string, string, string, string) {
+	// Helper to get value from CLI arg or env var
+	getValue := func(cliValue *string, envKey string, defaultValue ...string) string {
+		if cliValue != nil && *cliValue != "" {
+			return *cliValue
+		}
+		envValue := os.Getenv(envKey)
+		if envValue != "" {
+			return envValue
+		}
+		if len(defaultValue) > 0 {
+			return defaultValue[0]
+		}
+		return ""
+	}
+
+	// Mode has a default of "udp"
+	finalMode := getValue(mode, "MODE", "udp")
+
+	return finalMode,
+		getValue(host, "INFLUX_HOST"),
+		getValue(token, "INFLUX_TOKEN"),
+		getValue(org, "INFLUX_ORG"),
+		getValue(bucket, "INFLUX_BUCKET"),
+		getValue(weatherMeasurement, "WEATHER_MEASUREMENT"),
+		getValue(statusMeasurement, "STATUS_MEASUREMENT")
+}
+
+func initialModel() model {
+	_ = godotenv.Load()
+
+	// Parse CLI flags
+	mode := flag.String("mode", "udp", "Data source mode: 'udp' or 'influxdb'")
+	influxHost := flag.String("influx-host", "", "InfluxDB host URL")
+	influxToken := flag.String("influx-token", "", "InfluxDB token")
+	influxOrg := flag.String("influx-org", "", "InfluxDB organization")
+	influxBucket := flag.String("influx-bucket", "", "InfluxDB bucket")
+	weatherMeasurement := flag.String("weather-measurement", "weather", "Weather observation measurement name")
+	statusMeasurement := flag.String("status-measurement", "status", "Status measurement name")
+	flag.Parse()
+
+	s := spinner.New()
+	s.Spinner = spinner.Dot
+	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF6B6B"))
+
+	// Get configuration from CLI args or env vars
+	finalMode, host, token, org, bucket, weatherMeas, statusMeas := getConfig(
+		mode, influxHost, influxToken, influxOrg, influxBucket, weatherMeasurement, statusMeasurement,
+	)
+
+	// Determine data source
+	if finalMode == "influxdb" {
+		// Validate InfluxDB configuration
+		if host == "" || token == "" || org == "" || bucket == "" {
+			return model{
+				spinner:    s,
+				loading:    false,
+				err:        fmt.Errorf("InfluxDB mode requires: host, token, org, bucket"),
+				dataSource: SourceInfluxDB,
+			}
+		}
+
+		// Use InfluxDB mode
+		client := influxdb2.NewClient(host, token)
+		return model{
+			spinner:            s,
+			loading:            true,
+			dataSource:         SourceInfluxDB,
+			client:             client,
+			bucket:             bucket,
+			org:                org,
+			weatherMeasurement: weatherMeas,
+			statusMeasurement:  statusMeas,
+		}
+	}
+
+	// Use UDP mode
+	listener, err := NewUDPListener()
+	if err != nil {
+		return model{
+			spinner:    s,
+			loading:    false,
+			err:        err,
+			dataSource: SourceUDP,
+		}
+	}
+
+	return model{
+		spinner:     s,
+		loading:     true,
+		dataSource:  SourceUDP,
+		udpListener: listener,
+	}
+}
+
+func (m model) Init() tea.Cmd {
+	cmds := []tea.Cmd{m.spinner.Tick, tickCmd()}
+
+	if m.dataSource == SourceUDP && m.udpListener != nil {
+		m.udpListener.Start(m.udpListener.program)
+	} else if m.dataSource == SourceInfluxDB {
+		cmds = append(cmds, fetchWeatherInfluxDB(m.client, m.bucket, m.org, m.weatherMeasurement, m.statusMeasurement))
+	}
+
+	return tea.Batch(cmds...)
+}
+
+func tickCmd() tea.Cmd {
+	return tea.Tick(time.Second*2, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
+}
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "q":
-			m.client.Close()
+			if m.udpListener != nil {
+				m.udpListener.Close()
+			}
+			if m.client != nil {
+				m.client.Close()
+			}
 			return m, tea.Quit
 		}
 
@@ -279,10 +557,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tickMsg:
-		return m, tea.Batch(
-			fetchWeather(m.client, m.bucket, m.org, m.weatherMeasurement, m.statusMeasurement),
-			tickCmd(),
-		)
+		// Only fetch on tick for InfluxDB mode (UDP pushes updates)
+		if m.dataSource == SourceInfluxDB {
+			return m, tea.Batch(
+				fetchWeatherInfluxDB(m.client, m.bucket, m.org, m.weatherMeasurement, m.statusMeasurement),
+				tickCmd(),
+			)
+		}
+		return m, tickCmd()
 
 	case errMsg:
 		m.err = error(msg)
@@ -298,14 +580,28 @@ func (m model) View() string {
 		return fmt.Sprintf("Error: %v\n", m.err)
 	}
 
+	var loadingMsg string
+	if m.dataSource == SourceUDP {
+		loadingMsg = "Waiting for weather data from Tempest station (UDP)..."
+	} else {
+		loadingMsg = "Loading weather data from InfluxDB..."
+	}
+
 	if m.loading {
-		return fmt.Sprintf("\n\n   %s Loading weather data...\n\n", m.spinner.View())
+		return fmt.Sprintf("\n\n   %s %s\n\n", m.spinner.View(), loadingMsg)
 	}
 
 	var b strings.Builder
 
-	// Title
-	title := titleStyle.Render("🌤  LCAR.earth Weather Station")
+	// Title with data source indicator
+	sourceIndicator := ""
+	if m.dataSource == SourceUDP {
+		sourceIndicator = " 📡"
+	} else {
+		sourceIndicator = " 🗄️"
+	}
+
+	title := titleStyle.Render("🌤  LCAR.earth Weather Station" + sourceIndicator)
 	b.WriteString(title + "\n")
 
 	// Current conditions
@@ -455,7 +751,14 @@ func renderCompass(degrees float64) string {
 }
 
 func main() {
-	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
+	m := initialModel()
+	p := tea.NewProgram(m, tea.WithAltScreen())
+
+	// Pass program reference to UDP listener if using UDP mode
+	if m.udpListener != nil {
+		m.udpListener.program = p
+	}
+
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error: %v", err)
 		os.Exit(1)
