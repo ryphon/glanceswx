@@ -94,6 +94,34 @@ Then run:
 
 The app will automatically use InfluxDB mode when all required environment variables are set.
 
+#### Command-Line Flags
+
+You can also configure `glanceswx` using command-line flags. Note that environment variables will take precedence over command-line flags if both are provided for the same setting.
+
+```bash
+./glanceswx --help
+```
+
+**Available Flags:**
+
+- `--mode`: Data source mode: `udp` or `influxdb`. (Default: `udp`)
+- `--influx-host`: InfluxDB host URL.
+- `--influx-token`: InfluxDB token.
+- `--influx-org`: InfluxDB organization.
+- `--influx-bucket`: InfluxDB bucket.
+- `--weather-measurement`: Weather observation measurement name. (Default: `weather`)
+- `--status-measurement`: Status measurement name. (Default: `status`)
+
+**Example for InfluxDB mode using flags:**
+
+```bash
+./glanceswx --mode=influxdb \
+  --influx-host=https://your-influx-host.com \
+  --influx-token=your-influx-token \
+  --influx-org=your-org-id \
+  --influx-bucket=your-bucket-name
+```
+
 Press `q` or `Ctrl+C` to quit.
 
 ## How It Works
