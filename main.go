@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"math"
 	"net"
@@ -413,25 +414,69 @@ from(bucket: "%s")
 	}
 }
 
+func getConfig(mode, host, token, org, bucket, weatherMeasurement, statusMeasurement *string) (string, string, string, string, string, string) {
+	// Helper to get value from CLI arg or env var
+	getValue := func(cliValue *string, envKey string) string {
+		if cliValue != nil && *cliValue != "" {
+			return *cliValue
+		}
+		return os.Getenv(envKey)
+	}
+
+	return getValue(host, "INFLUX_HOST"),
+		getValue(token, "INFLUX_TOKEN"),
+		getValue(org, "INFLUX_ORG"),
+		getValue(bucket, "INFLUX_BUCKET"),
+		getValue(weatherMeasurement, "WEATHER_MEASUREMENT"),
+		getValue(statusMeasurement, "STATUS_MEASUREMENT")
+}
+
 func initialModel() model {
 	_ = godotenv.Load()
+
+	// Parse CLI flags
+	mode := flag.String("mode", "", "Data source mode: 'udp' or 'influxdb' (default: auto-detect)")
+	influxHost := flag.String("influx-host", "", "InfluxDB host URL")
+	influxToken := flag.String("influx-token", "", "InfluxDB token")
+	influxOrg := flag.String("influx-org", "", "InfluxDB organization")
+	influxBucket := flag.String("influx-bucket", "", "InfluxDB bucket")
+	weatherMeasurement := flag.String("weather-measurement", "", "Weather observation measurement name")
+	statusMeasurement := flag.String("status-measurement", "", "Status measurement name")
+	flag.Parse()
 
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF6B6B"))
 
-	// Check for InfluxDB configuration
-	host := os.Getenv("INFLUX_HOST")
-	token := os.Getenv("INFLUX_TOKEN")
-	org := os.Getenv("INFLUX_ORG")
-	bucket := os.Getenv("INFLUX_BUCKET")
-	weatherMeasurement := os.Getenv("WEATHER_MEASUREMENT")
-	statusMeasurement := os.Getenv("STATUS_MEASUREMENT")
+	// Get configuration from CLI args or env vars
+	host, token, org, bucket, weatherMeas, statusMeas := getConfig(
+		mode, influxHost, influxToken, influxOrg, influxBucket, weatherMeasurement, statusMeasurement,
+	)
 
-	hasInfluxConfig := host != "" && token != "" && org != "" && bucket != "" &&
-		weatherMeasurement != "" && statusMeasurement != ""
+	// Determine data source
+	useInfluxDB := false
+	if mode != nil && *mode == "influxdb" {
+		useInfluxDB = true
+	} else if mode != nil && *mode == "udp" {
+		useInfluxDB = false
+	} else {
+		// Auto-detect: use InfluxDB if all required config is present
+		hasInfluxConfig := host != "" && token != "" && org != "" && bucket != "" &&
+			weatherMeas != "" && statusMeas != ""
+		useInfluxDB = hasInfluxConfig
+	}
 
-	if hasInfluxConfig {
+	if useInfluxDB {
+		// Validate InfluxDB configuration
+		if host == "" || token == "" || org == "" || bucket == "" || weatherMeas == "" || statusMeas == "" {
+			return model{
+				spinner:    s,
+				loading:    false,
+				err:        fmt.Errorf("InfluxDB mode requires: host, token, org, bucket, weather-measurement, status-measurement"),
+				dataSource: SourceInfluxDB,
+			}
+		}
+
 		// Use InfluxDB mode
 		client := influxdb2.NewClient(host, token)
 		return model{
@@ -441,8 +486,8 @@ func initialModel() model {
 			client:             client,
 			bucket:             bucket,
 			org:                org,
-			weatherMeasurement: weatherMeasurement,
-			statusMeasurement:  statusMeasurement,
+			weatherMeasurement: weatherMeas,
+			statusMeasurement:  statusMeas,
 		}
 	}
 
