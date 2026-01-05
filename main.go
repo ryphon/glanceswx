@@ -30,7 +30,7 @@ var (
 
 	valueStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("#04B575"))
+			Foreground(lipgloss.Color("#FFFFFF"))
 
 	boxStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
@@ -93,6 +93,7 @@ type model struct {
 	org                string
 	weatherMeasurement string
 	statusMeasurement  string
+	startTime          time.Time
 }
 
 type tickMsg time.Time
@@ -465,6 +466,8 @@ func initialModel() model {
 	)
 
 	// Determine data source
+	startTime := time.Now()
+
 	if finalMode == "influxdb" {
 		// Validate InfluxDB configuration
 		if host == "" || token == "" || org == "" || bucket == "" {
@@ -473,6 +476,7 @@ func initialModel() model {
 				loading:    false,
 				err:        fmt.Errorf("InfluxDB mode requires: host, token, org, bucket"),
 				dataSource: SourceInfluxDB,
+				startTime:  startTime,
 			}
 		}
 
@@ -487,6 +491,7 @@ func initialModel() model {
 			org:                org,
 			weatherMeasurement: weatherMeas,
 			statusMeasurement:  statusMeas,
+			startTime:          startTime,
 		}
 	}
 
@@ -498,6 +503,7 @@ func initialModel() model {
 			loading:    false,
 			err:        err,
 			dataSource: SourceUDP,
+			startTime:  startTime,
 		}
 	}
 
@@ -506,6 +512,7 @@ func initialModel() model {
 		loading:     true,
 		dataSource:  SourceUDP,
 		udpListener: listener,
+		startTime:   startTime,
 	}
 }
 
@@ -611,9 +618,16 @@ func (m model) View() string {
 	b.WriteString(currentBox)
 
 	// Footer
-	footer := labelStyle.Render(fmt.Sprintf("\nUpdated: %s | Press q to quit",
-		m.weather.UpdatedAt.Format("15:04:05")))
-	b.WriteString("\n" + footer)
+	whiteStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF"))
+	runtime := time.Since(m.startTime)
+
+	footer := fmt.Sprintf("\n%s %s | %s %s | %s",
+		labelStyle.Render("Updated:"),
+		whiteStyle.Render(m.weather.UpdatedAt.Format("15:04:05")),
+		labelStyle.Render("Runtime:"),
+		whiteStyle.Render(formatDuration(runtime)),
+		labelStyle.Render("Press q to quit"))
+	b.WriteString(footer)
 
 	return b.String()
 }
@@ -697,6 +711,19 @@ func formatUptime(seconds int64) string {
 		return fmt.Sprintf("%dh %dm", hours, minutes)
 	}
 	return fmt.Sprintf("%dm", minutes)
+}
+
+func formatDuration(d time.Duration) string {
+	hours := int(d.Hours())
+	minutes := int(d.Minutes()) % 60
+	seconds := int(d.Seconds()) % 60
+
+	if hours > 0 {
+		return fmt.Sprintf("%dh %dm %ds", hours, minutes, seconds)
+	} else if minutes > 0 {
+		return fmt.Sprintf("%dm %ds", minutes, seconds)
+	}
+	return fmt.Sprintf("%ds", seconds)
 }
 
 func getWindDirection(degrees float64) string {
